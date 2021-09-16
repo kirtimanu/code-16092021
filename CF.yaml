@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC: a private service registry (aka. Cloud Map private namespace), a cloudonaut.io template'
+Parameters:
+  StandardQueueName:
+    Type: String
+    Description: Standard Queue Name
+    Default: VSQSQueue
+  TopicName:
+    Type: String
+    Description:  Topic Name
+    Default: vsqstopic
+  LambdaName:
+    Type: String
+    Description:  Topic Name
+    Default: vsqslambda
+  BucketName:
+    Type: String
+    Description: The name of the S3 Bucket to create
+    Default: vsqsbucket
+
+Resources:
+  VSQS:
+    Type: AWS::SQS::Queue
+    Properties: 
+      QueueName: !Ref StandardQueueName
+
+  VSNSTopic: 
+    Type: AWS::SNS::Topic
+    Properties: 
+      Subscription: 
+        - Endpoint: !GetAtt VSQS.Arn
+          Protocol: "sqs"
+      TopicName: !Ref TopicName
+
+  VLambdaRole: 
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'
+        Statement: 
+        - Effect: Allow
+          Principal: 
+            Service: lambda.amazonaws.com
+          Action: 
+          - sts:AssumeRole
+      Path: '/'
+      Policies: 
+      - PolicyName: vlogs
+        PolicyDocument: 
+          Statement: 
+          - Effect: Allow
+            Action: 
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: vsqs
+        PolicyDocument: 
+          Statement: 
+          - Effect: Allow
+            Action: 
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            Resource: !GetAtt VSQS.Arn
+      - PolicyName: vs3
+        PolicyDocument: 
+          Statement: 
+          - Effect: Allow
+            Action: 
+            - s3:PutObject
+            - s3:GetObject
+            Resource: "*"
+  
+  VSQSLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - VS3Bucket
+    Properties:
+      FunctionName: !Ref LambdaName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+
+          def lambda_handler(event, context):
+            body = {
+                "message_received_from_sqs": event["Records"][0]["body"]
+            }
+            s3 = boto3.client('s3')
+            s3BucketName = os.environ['S3BucketName']
+            fileName = round(time.time() * 1000)
+            s3.put_object(
+                Body=json.dumps(body),
+                Bucket=s3BucketName,
+                Key=str(fileName)
+            )
+            response = {
+                "statusCode": 200,
+                "body": json.dumps(body)
+            }
+            return response
+
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          S3BucketName: !Ref BucketName
+      Runtime: python3.8
+      Role: !GetAtt VLambdaRole.Arn
+
+  lambdaSqs:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      EventSourceArn: !GetAtt VSQS.Arn
+      FunctionName: !Ref VSQSLambdaFunction
+  
+  VS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          -
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+            NoncurrentVersionExpirationInDays: 7
+            Status: Enabled
